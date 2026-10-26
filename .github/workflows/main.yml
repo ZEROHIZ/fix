@@ -22,10 +22,22 @@ jobs:
           static BOOL hook_no(id self, SEL _cmd) { return NO; }
 
           __attribute__((constructor)) static void init() {
+              // 1. 自动清理导致二次冷启动崩溃的孤立缓存（保留账号登录态）
+              NSFileManager *fm = [NSFileManager defaultManager];
+              NSString *libPath = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+              NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+              
+              // 清理会导致二次启动崩溃的 Caches / WebKit / Flutter 缓存，不动 Documents 下的账号数据库
+              [fm removeItemAtPath:[libPath stringByAppendingPathComponent:@"Caches"] error:nil];
+              [fm removeItemAtPath:[libPath stringByAppendingPathComponent:@"WebKit"] error:nil];
+              [fm removeItemAtPath:[libPath stringByAppendingPathComponent:@"Saved Application State"] error:nil];
+              [fm removeItemAtPath:[docPath stringByAppendingPathComponent:@"OpenImResource"] error:nil];
+              [fm removeItemAtPath:[docPath stringByAppendingPathComponent:@"MemoryStat"] error:nil];
+
+              // 2. 拦截 Siri 与 Spotlight 权限崩溃
               dlopen("/System/Library/Frameworks/Intents.framework/Intents", RTLD_NOW);
               dlopen("/System/Library/Frameworks/CoreSpotlight.framework/CoreSpotlight", RTLD_NOW);
               
-              // 1. 拦截 INPreferences
               Class c = objc_getClass("INPreferences");
               if (c) {
                   Class meta = object_getClass((id)c);
@@ -35,28 +47,15 @@ jobs:
                   class_replaceMethod(c, sel_registerName("_siriAuthorizationStatus"), (IMP)hook_status, "q@:");
                   class_replaceMethod(c, sel_registerName("_requestSiriAuthorization:"), (IMP)hook_req, "v@:@?");
               }
-              
-              // 2. 拦截 INVocabulary (通讯录/热词缓存同步崩溃点)
               Class v = objc_getClass("INVocabulary");
               if (v) {
                   Class vmeta = object_getClass((id)v);
                   class_replaceMethod(vmeta, sel_registerName("sharedVocabulary"), (IMP)hook_nil, "@@:");
-                  class_replaceMethod(v, sel_registerName("setVocabularyStrings:ofType:"), (IMP)hook_req, "v@:@@");
-                  class_replaceMethod(v, sel_registerName("setVocabulary:ofType:"), (IMP)hook_req, "v@:@@");
-                  class_replaceMethod(v, sel_registerName("removeAllVocabularyStrings"), (IMP)hook_nil, "v@:");
               }
-
-              // 3. 拦截 INInteraction (冷启动读取最近会话缓存时的最大崩溃点)
               Class inter = objc_getClass("INInteraction");
               if (inter) {
                   class_replaceMethod(inter, sel_registerName("donateInteractionWithCompletion:"), (IMP)hook_donate, "v@:@?");
-                  Class imeta = object_getClass((id)inter);
-                  class_replaceMethod(imeta, sel_registerName("deleteAllInteractionsWithCompletion:"), (IMP)hook_donate, "v@:@?");
-                  class_replaceMethod(imeta, sel_registerName("deleteInteractionsWithIdentifiers:completion:"), (IMP)hook_req, "v@:@@?");
-                  class_replaceMethod(imeta, sel_registerName("deleteInteractionsWithGroupIdentifier:completion:"), (IMP)hook_req, "v@:@@?");
               }
-
-              // 4. 拦截 CoreSpotlight 搜索索引 (冷启动写入缓存崩溃点)
               Class cs = objc_getClass("CSSearchableIndex");
               if (cs) {
                   Class csmeta = object_getClass((id)cs);
