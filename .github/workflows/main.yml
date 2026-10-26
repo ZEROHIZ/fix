@@ -9,21 +9,64 @@ jobs:
           cat << 'EOF' > fix.m
           #import <Foundation/Foundation.h>
           #import <objc/runtime.h>
+          #import <dlfcn.h>
+
+          static id hook_nil(id self, SEL _cmd) { return nil; }
+          static NSInteger hook_status(id self, SEL _cmd) { return 2; }
+          static void hook_req(id self, SEL _cmd, void (^handler)(NSInteger)) {
+              if (handler) handler(2);
+          }
+          static void hook_donate(id self, SEL _cmd, void (^handler)(NSError *)) {
+              if (handler) handler(nil);
+          }
+          static BOOL hook_no(id self, SEL _cmd) { return NO; }
+
           __attribute__((constructor)) static void init() {
+              dlopen("/System/Library/Frameworks/Intents.framework/Intents", RTLD_NOW);
+              dlopen("/System/Library/Frameworks/CoreSpotlight.framework/CoreSpotlight", RTLD_NOW);
+              
+              // 1. 拦截 INPreferences
               Class c = objc_getClass("INPreferences");
               if (c) {
-                  method_setImplementation(class_getClassMethod(c, @selector(sharedPreferences)), imp_implementationWithBlock(^id(id s){ return nil; }));
-                  method_setImplementation(class_getClassMethod(c, @selector(siriAuthorizationStatus)), imp_implementationWithBlock(^NSInteger(id s){ return 2; }));
-                  method_setImplementation(class_getClassMethod(c, @selector(requestSiriAuthorization:)), imp_implementationWithBlock(^void(id s, id b){}));
+                  Class meta = object_getClass((id)c);
+                  class_replaceMethod(meta, sel_registerName("sharedPreferences"), (IMP)hook_nil, "@@:");
+                  class_replaceMethod(meta, sel_registerName("siriAuthorizationStatus"), (IMP)hook_status, "q@:");
+                  class_replaceMethod(meta, sel_registerName("requestSiriAuthorization:"), (IMP)hook_req, "v@:@?");
+                  class_replaceMethod(c, sel_registerName("_siriAuthorizationStatus"), (IMP)hook_status, "q@:");
+                  class_replaceMethod(c, sel_registerName("_requestSiriAuthorization:"), (IMP)hook_req, "v@:@?");
               }
+              
+              // 2. 拦截 INVocabulary (通讯录/热词缓存同步崩溃点)
               Class v = objc_getClass("INVocabulary");
               if (v) {
-                  method_setImplementation(class_getClassMethod(v, @selector(sharedVocabulary)), imp_implementationWithBlock(^id(id s){ return nil; }));
+                  Class vmeta = object_getClass((id)v);
+                  class_replaceMethod(vmeta, sel_registerName("sharedVocabulary"), (IMP)hook_nil, "@@:");
+                  class_replaceMethod(v, sel_registerName("setVocabularyStrings:ofType:"), (IMP)hook_req, "v@:@@");
+                  class_replaceMethod(v, sel_registerName("setVocabulary:ofType:"), (IMP)hook_req, "v@:@@");
+                  class_replaceMethod(v, sel_registerName("removeAllVocabularyStrings"), (IMP)hook_nil, "v@:");
+              }
+
+              // 3. 拦截 INInteraction (冷启动读取最近会话缓存时的最大崩溃点)
+              Class inter = objc_getClass("INInteraction");
+              if (inter) {
+                  class_replaceMethod(inter, sel_registerName("donateInteractionWithCompletion:"), (IMP)hook_donate, "v@:@?");
+                  Class imeta = object_getClass((id)inter);
+                  class_replaceMethod(imeta, sel_registerName("deleteAllInteractionsWithCompletion:"), (IMP)hook_donate, "v@:@?");
+                  class_replaceMethod(imeta, sel_registerName("deleteInteractionsWithIdentifiers:completion:"), (IMP)hook_req, "v@:@@?");
+                  class_replaceMethod(imeta, sel_registerName("deleteInteractionsWithGroupIdentifier:completion:"), (IMP)hook_req, "v@:@@?");
+              }
+
+              // 4. 拦截 CoreSpotlight 搜索索引 (冷启动写入缓存崩溃点)
+              Class cs = objc_getClass("CSSearchableIndex");
+              if (cs) {
+                  Class csmeta = object_getClass((id)cs);
+                  class_replaceMethod(csmeta, sel_registerName("isIndexingAvailable"), (IMP)hook_no, "B@:");
+                  class_replaceMethod(csmeta, sel_registerName("defaultSearchableIndex"), (IMP)hook_nil, "@@:");
               }
           }
           EOF
-          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib -framework Foundation fix.m -o BypassSiri.dylib
-          codesign -f -s - BypassSiri.dylib
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib -framework Foundation -Wl,-install_name,@rpath/BypassSiri.dylib fix.m -o BypassSiri.dylib
+          ldid -S BypassSiri.dylib || codesign -f -s - BypassSiri.dylib
       - uses: actions/upload-artifact@v4
         with:
           name: BypassSiri
