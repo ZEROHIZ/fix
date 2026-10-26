@@ -4,7 +4,7 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - name: Compile
+      - name: Write Source Code
         run: |
           cat << 'EOF' > fix.m
           #import <Foundation/Foundation.h>
@@ -16,7 +16,6 @@ jobs:
           #import <mach/mach.h>
           #import <pthread.h>
 
-          // 1. 拦截 Siri 与 Spotlight 权限崩溃
           static id hook_nil(id self, SEL _cmd) { return nil; }
           static NSInteger hook_status(id self, SEL _cmd) { return 2; }
           static void hook_req(id self, SEL _cmd, void (^handler)(NSInteger)) {
@@ -25,4 +24,96 @@ jobs:
           static void hook_donate(id self, SEL _cmd, void (^handler)(NSError *)) {
               if (handler) handler(nil);
           }
-          static BOOL hook_no(id self, SEL _cmd) { return NO
+          static BOOL hook_no(id self, SEL _cmd) { return NO; }
+
+          static void* (*orig_str_assign)(void *this_ptr, const void *other_ptr) = NULL;
+          static pthread_mutex_t str_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+          static void* safe_str_assign(void *this_ptr, const void *other_ptr) {
+              if ((uintptr_t)this_ptr < 0x1000 || (uintptr_t)other_ptr < 0x1000) {
+                  return this_ptr;
+              }
+              pthread_mutex_lock(&str_mutex);
+              void *ret = orig_str_assign(this_ptr, other_ptr);
+              pthread_mutex_unlock(&str_mutex);
+              return ret;
+          }
+
+          static void rebind_image(const struct mach_header * mh, intptr_t slide) {
+              if (!orig_str_assign) return;
+              const struct mach_header_64 *header = (const struct mach_header_64 *)mh;
+              if (header->magic != MH_MAGIC_64) return;
+
+              uintptr_t cur = (uintptr_t)header + sizeof(struct mach_header_64);
+              for (uint32_t j = 0; j < header->ncmds; j++) {
+                  const struct load_command *lc = (const struct load_command *)cur;
+                  if (lc->cmd == LC_SEGMENT_64) {
+                      const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+                      if (strncmp(seg->segname, "__DATA", 6) == 0 || strncmp(seg->segname, "__AUTH", 6) == 0) {
+                          const struct section_64 *sec = (const struct section_64 *)((uintptr_t)seg + sizeof(struct segment_command_64));
+                          for (uint32_t k = 0; k < seg->nsects; k++) {
+                              uint32_t type = sec[k].flags & SECTION_TYPE;
+                              if (type == S_NON_LAZY_SYMBOL_POINTERS || type == S_LAZY_SYMBOL_POINTERS) {
+                                  void **ptrs = (void **)(sec[k].addr + slide);
+                                  size_t count_ptrs = sec[k].size / sizeof(void *);
+                                  vm_protect(mach_task_self(), (vm_address_t)ptrs, sec[k].size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                                  for (size_t p = 0; p < count_ptrs; p++) {
+                                      if (ptrs[p] == (void *)orig_str_assign) {
+                                          ptrs[p] = (void *)safe_str_assign;
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  cur += lc->cmdsize;
+              }
+          }
+
+          __attribute__((constructor)) static void init() {
+              dlopen("/System/Library/Frameworks/Intents.framework/Intents", RTLD_NOW);
+              dlopen("/System/Library/Frameworks/CoreSpotlight.framework/CoreSpotlight", RTLD_NOW);
+              
+              Class c = objc_getClass("INPreferences");
+              if (c) {
+                  Class meta = object_getClass((id)c);
+                  class_replaceMethod(meta, sel_registerName("sharedPreferences"), (IMP)hook_nil, "@@:");
+                  class_replaceMethod(meta, sel_registerName("siriAuthorizationStatus"), (IMP)hook_status, "q@:");
+                  class_replaceMethod(meta, sel_registerName("requestSiriAuthorization:"), (IMP)hook_req, "v@:@?");
+                  class_replaceMethod(c, sel_registerName("_siriAuthorizationStatus"), (IMP)hook_status, "q@:");
+                  class_replaceMethod(c, sel_registerName("_requestSiriAuthorization:"), (IMP)hook_req, "v@:@?");
+              }
+              Class v = objc_getClass("INVocabulary");
+              if (v) {
+                  Class vmeta = object_getClass((id)v);
+                  class_replaceMethod(vmeta, sel_registerName("sharedVocabulary"), (IMP)hook_nil, "@@:");
+              }
+              Class inter = objc_getClass("INInteraction");
+              if (inter) {
+                  class_replaceMethod(inter, sel_registerName("donateInteractionWithCompletion:"), (IMP)hook_donate, "v@:@?");
+              }
+              Class cs = objc_getClass("CSSearchableIndex");
+              if (cs) {
+                  Class csmeta = object_getClass((id)cs);
+                  class_replaceMethod(csmeta, sel_registerName("isIndexingAvailable"), (IMP)hook_no, "B@:");
+                  class_replaceMethod(csmeta, sel_registerName("defaultSearchableIndex"), (IMP)hook_nil, "@@:");
+              }
+
+              orig_str_assign = dlsym(RTLD_DEFAULT, "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_");
+              if (orig_str_assign) {
+                  _dyld_register_func_for_add_image(rebind_image);
+              }
+          }
+          EOF
+
+      - name: Compile Dylib
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib -framework Foundation -Wl,-install_name,@rpath/BypassSiri.dylib fix.m -o BypassSiri.dylib
+          codesign -f -s - BypassSiri.dylib
+          ls -lh BypassSiri.dylib
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BypassSiri
+          path: BypassSiri.dylib
