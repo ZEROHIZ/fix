@@ -14,6 +14,7 @@ jobs:
           #import <mach-o/loader.h>
           #import <mach-o/nlist.h>
           #import <mach/mach.h>
+          #import <pthread.h>
 
           // 1. 拦截 Siri 与 Spotlight 权限崩溃
           static id hook_nil(id self, SEL _cmd) { return nil; }
@@ -24,101 +25,4 @@ jobs:
           static void hook_donate(id self, SEL _cmd, void (^handler)(NSError *)) {
               if (handler) handler(nil);
           }
-          static BOOL hook_no(id self, SEL _cmd) { return NO; }
-
-          // 2. 拦截 mmevent::cgievent 的 std::string::operator= 空指针崩溃 (0x17)
-          static void* (*orig_str_assign)(void *this_ptr, const void *other_ptr) = NULL;
-
-          // 自带自旋锁防止 7 个 mmevent::cgievent 线程同时写同一个全局 string 撕裂内存
-          static os_unfair_lock str_lock = OS_UNFAIR_LOCK_INIT;
-
-          static void* safe_str_assign(void *this_ptr, const void *other_ptr) {
-              // 如果传入的 this 或源 string 指针为空/非法低地址（导致读 0x17 崩溃），直接安全返回
-              if ((uintptr_t)this_ptr < 0x1000 || (uintptr_t)other_ptr < 0x1000) {
-                  return this_ptr;
-              }
-              os_unfair_lock_lock(&str_lock);
-              void *ret = orig_str_assign(this_ptr, other_ptr);
-              os_unfair_lock_unlock(&str_lock);
-              return ret;
-          }
-
-          // 极简 GOT 表 Hook：替换 WeChat 主程序对 _ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_ 的调用
-          static void rebind_wechat_got() {
-              orig_str_assign = dlsym(RTLD_DEFAULT, "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_");
-              if (!orig_str_assign) return;
-
-              uint32_t count = _dyld_image_count();
-              for (uint32_t i = 0; i < count; i++) {
-                  const char *name = _dyld_get_image_name(i);
-                  if (!name || !strstr(name, "/WeChat")) continue;
-
-                  const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
-                  intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-                  uintptr_t cur = (uintptr_t)header + sizeof(struct mach_header_64);
-
-                  for (uint32_t j = 0; j < header->ncmds; j++) {
-                      const struct load_command *lc = (const struct load_command *)cur;
-                      if (lc->cmd == LC_SEGMENT_64) {
-                          const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-                          if (strncmp(seg->segname, "__DATA", 6) == 0 || strncmp(seg->segname, "__AUTH", 6) == 0) {
-                              const struct section_64 *sec = (const struct section_64 *)((uintptr_t)seg + sizeof(struct segment_command_64));
-                              for (uint32_t k = 0; k < seg->nsects; k++) {
-                                  uint32_t type = sec[k].flags & SECTION_TYPE;
-                                  if (type == S_NON_LAZY_SYMBOL_POINTERS || type == S_LAZY_SYMBOL_POINTERS) {
-                                      void **ptrs = (void **)(sec[k].addr + slide);
-                                      size_t count_ptrs = sec[k].size / sizeof(void *);
-                                      vm_protect(mach_task_self(), (vm_address_t)ptrs, sec[k].size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-                                      for (size_t p = 0; p < count_ptrs; p++) {
-                                          if (ptrs[p] == (void *)orig_str_assign) {
-                                              ptrs[p] = (void *)safe_str_assign;
-                                          }
-                                      }
-                                  }
-                              }
-                          }
-                      }
-                      cur += lc->cmdsize;
-                  }
-              }
-          }
-
-          __attribute__((constructor)) static void init() {
-              dlopen("/System/Library/Frameworks/Intents.framework/Intents", RTLD_NOW);
-              dlopen("/System/Library/Frameworks/CoreSpotlight.framework/CoreSpotlight", RTLD_NOW);
-              
-              Class c = objc_getClass("INPreferences");
-              if (c) {
-                  Class meta = object_getClass((id)c);
-                  class_replaceMethod(meta, sel_registerName("sharedPreferences"), (IMP)hook_nil, "@@:");
-                  class_replaceMethod(meta, sel_registerName("siriAuthorizationStatus"), (IMP)hook_status, "q@:");
-                  class_replaceMethod(meta, sel_registerName("requestSiriAuthorization:"), (IMP)hook_req, "v@:@?");
-                  class_replaceMethod(c, sel_registerName("_siriAuthorizationStatus"), (IMP)hook_status, "q@:");
-                  class_replaceMethod(c, sel_registerName("_requestSiriAuthorization:"), (IMP)hook_req, "v@:@?");
-              }
-              Class v = objc_getClass("INVocabulary");
-              if (v) {
-                  Class vmeta = object_getClass((id)v);
-                  class_replaceMethod(vmeta, sel_registerName("sharedVocabulary"), (IMP)hook_nil, "@@:");
-              }
-              Class inter = objc_getClass("INInteraction");
-              if (inter) {
-                  class_replaceMethod(inter, sel_registerName("donateInteractionWithCompletion:"), (IMP)hook_donate, "v@:@?");
-              }
-              Class cs = objc_getClass("CSSearchableIndex");
-              if (cs) {
-                  Class csmeta = object_getClass((id)cs);
-                  class_replaceMethod(csmeta, sel_registerName("isIndexingAvailable"), (IMP)hook_no, "B@:");
-                  class_replaceMethod(csmeta, sel_registerName("defaultSearchableIndex"), (IMP)hook_nil, "@@:");
-              }
-
-              // 挂载 C++ string 0x17 空指针防崩钩子
-              rebind_wechat_got();
-          }
-          EOF
-          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib -framework Foundation -Wl,-install_name,@rpath/BypassSiri.dylib fix.m -o BypassSiri.dylib
-          ldid -S BypassSiri.dylib || codesign -f -s - BypassSiri.dylib
-      - uses: actions/upload-artifact@v4
-        with:
-          name: BypassSiri
-          path: BypassSiri.dylib
+          static BOOL hook_no(id self, SEL _cmd) { return NO
