@@ -1,0 +1,30 @@
+name: Build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Compile
+        run: |
+          cat << 'EOF' > fix.m
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+          __attribute__((constructor)) static void init() {
+              Class c = objc_getClass("INPreferences");
+              if (c) {
+                  method_setImplementation(class_getClassMethod(c, @selector(sharedPreferences)), imp_implementationWithBlock(^id(id s){ return nil; }));
+                  method_setImplementation(class_getClassMethod(c, @selector(siriAuthorizationStatus)), imp_implementationWithBlock(^NSInteger(id s){ return 2; }));
+                  method_setImplementation(class_getClassMethod(c, @selector(requestSiriAuthorization:)), imp_implementationWithBlock(^void(id s, id b){}));
+              }
+              Class v = objc_getClass("INVocabulary");
+              if (v) {
+                  method_setImplementation(class_getClassMethod(v, @selector(sharedVocabulary)), imp_implementationWithBlock(^id(id s){ return nil; }));
+              }
+          }
+          EOF
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib -framework Foundation fix.m -o BypassSiri.dylib
+          codesign -f -s - BypassSiri.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BypassSiri
+          path: BypassSiri.dylib
